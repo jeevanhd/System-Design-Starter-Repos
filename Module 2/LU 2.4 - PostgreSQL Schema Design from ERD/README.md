@@ -263,3 +263,85 @@ helpdesk-schema-repair/
 ├── README.md                    ← this file — update with your decisions
 └── package.json                 ← npm scripts — do not edit
 ```
+
+---
+
+# My Submission — Schema Repair (branch `schema-repair`)
+
+## ERD-to-Schema Decisions
+
+### Decision 1: Column type decision — `tickets.priority` and `tickets.status`
+ERD said: `priority "low|medium|high|urgent"` and `status "open|pending|resolved|closed"` — pipe-separated lists inside a `string` attribute.
+Schema decided: `TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent'))` and `TEXT NOT NULL CHECK (status IN ('open','pending','resolved','closed'))`. No PostgreSQL `ENUM` type, and no `VARCHAR(n)`.
+Reason: the ERD states the allowed values but not how to enforce them, and it never states a length. A CHECK list is one rule on the table, so adding a status next year (say `reopened`) is a single statement, while removing a value from an `ENUM` type is awkward and the type is a separate object to manage. `TEXT` is used rather than `VARCHAR(n)` because in PostgreSQL the two perform the same and a limit here would be an invented rule the ERD never asked for. The rejected `priority` values are now impossible: a ticket cannot be filed as `critical`, because the database refuses the row, not because application code remembers to check.
+
+### Decision 2: ON DELETE decision — `tickets.assignee_id`
+ERD said: `uuid assignee_id FK "nullable"` and the relationship is `Agent o|--o{ Ticket : "assigned to"` — zero or one agent per ticket, and the attribute is explicitly nullable.
+Schema decided: `assignee_id UUID REFERENCES agents(id) ON DELETE SET NULL`. The other agent link on the same table, `created_by`, takes `ON DELETE RESTRICT`.
+Reason: the ERD shows the link is optional, but it says nothing about what happens when that agent row is deleted. Two different facts live on those two columns. `created_by` is an audit record — the ticket must always be able to name who filed it, so the delete is refused and history stays correct. `assignee_id` is only today's owner, so when an agent leaves, the ticket should survive and become unassigned rather than disappear or block the delete. `CASCADE` would have been wrong on both: deleting an agent must never delete the tickets they filed or were working on. `SET NULL` also requires the column to stay nullable, which is why `NOT NULL` was not added here.
+
+### Decision 3: Default value decision — `created_at` on every table
+ERD said: `timestamp created_at` on all six entities. It records that the row has a creation time, and nothing about who fills it in.
+Schema decided: `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `DEFAULT FALSE` on `comments.internal`, `DEFAULT 'open'` on `tickets.status`, and `DEFAULT NOW()` on `ticket_tags.added_at`. `resolved_at` and `deactivated_at` get no default, because their empty state is meaningful: NULL means "not resolved yet" and "still active".
+Reason: a default that lives only in application code is not a rule. A migration script, a backfill, a manual `INSERT` in a console, or a second service would all skip it and write NULL or the wrong value. `DEFAULT NOW()` puts the timestamp on the server clock, so every row has one moment of truth no matter which path created it, and `TIMESTAMPTZ` stores the exact moment rather than a wall-clock reading that reads differently in each time zone. Nullable columns are left without a default on purpose: `DEFAULT NOW()` on `resolved_at` would claim every ticket was resolved the instant it was created.
+
+## Rejected Table Shape
+
+### Shape: an array of tags on the ticket — `tickets.tags TEXT[]`
+What it was: the starter schema kept tags as a text array column on `tickets`, so one ticket row held its tag names directly, for example `{billing,vip}`. The ERD instead models `Tag` and `TicketTag` as entities of their own. I removed the `ALTER TABLE tickets ADD COLUMN tags TEXT[]` line entirely and created `tags` (`id`, `org_id`, `name`, `color_hex`) and `ticket_tags` (`id`, `ticket_id`, `tag_id`, `added_by`, `added_at`).
+Why rejected: in the array, a tag has no identity of its own. There is no row to rename, so renaming "billing" to "invoices" means rewriting every ticket that mentions it, and nothing checks spelling — `billing`, `Billing` and `billling` become three different tags. The array also cannot carry the attributes the ERD gives a tag: no `color_hex`, no owning `org_id`, and no record of which agent applied it or when, so the audit trail in `ticket_tags.added_by` and `added_at` is simply lost.
+What would break: every tag-shaped query becomes a scan and a string comparison instead of an indexed join — "all tickets tagged billing in this org" reads every ticket row and parses an array. Deleting an organization could not cascade to its tags, because the array has no `org_id`. Two agents tagging the same ticket concurrently could produce duplicates with no constraint to stop them, while the join table's `UNIQUE (ticket_id, tag_id)` refuses a second identical application. And the array cannot enforce that a ticket's tag belongs to the same organization as the ticket, which `tags.org_id` makes checkable.
+
+## Additional integrity rules added (no columns invented)
+
+- `UNIQUE (org_id, name)` on `tags` — one tag name per organization, which is what stops the spelling drift the array allowed.
+- `UNIQUE (ticket_id, tag_id)` on `ticket_tags` — the same tag cannot be applied to the same ticket twice.
+- `UNIQUE` on `agents.email` — the ERD does not mark it, but an email identifies an account, and the assignment requires it.
+
+## Test Output
+
+36/36 pgTAP assertions pass:
+
+```
+1..36
+ok 1 - organizations table exists
+ok 2 - agents table exists
+ok 3 - tickets table exists
+ok 4 - comments table exists
+ok 5 - tags table exists
+ok 6 - ticket_tags table exists
+ok 7 - organizations.id is UUID
+ok 8 - agents.id is UUID
+ok 9 - tickets.id is UUID
+ok 10 - comments.id is UUID
+ok 11 - tags.id is UUID
+ok 12 - ticket_tags.id is UUID
+ok 13 - agents.org_id is UUID FK
+ok 14 - tickets.org_id is UUID FK
+ok 15 - tickets.created_by is UUID FK
+ok 16 - tickets.assignee_id is UUID FK
+ok 17 - organizations.created_at is TIMESTAMPTZ
+ok 18 - tickets.created_at is TIMESTAMPTZ
+ok 19 - comments.created_at is TIMESTAMPTZ
+ok 20 - comments.internal is BOOLEAN not TEXT
+ok 21 - organizations.name is NOT NULL
+ok 22 - agents.name is NOT NULL
+ok 23 - agents.email is NOT NULL
+ok 24 - agents.org_id is NOT NULL
+ok 25 - tickets.subject is NOT NULL
+ok 26 - tickets.status is NOT NULL
+ok 27 - tickets.org_id is NOT NULL
+ok 28 - tickets.created_by is NOT NULL
+ok 29 - comments.body is NOT NULL
+ok 30 - comments.ticket_id is NOT NULL
+ok 31 - comments.author_id is NOT NULL
+ok 32 - tickets.assignee_id is nullable
+ok 33 - tickets.resolved_at is nullable
+ok 34 - agents.deactivated_at is nullable
+ok 35 - tickets.tags array column must be removed
+ok 36 - agents.email is UNIQUE
+1..36
+All tests successful.
+```
+
+Behaviour checked by hand on top of the tests: a `plan` of `free` is refused by the CHECK, a duplicate `agents.email` is refused by UNIQUE, deleting an agent who filed a ticket is refused by RESTRICT, deleting the assignee leaves the ticket with `assignee_id` NULL, deleting a tag removes its `ticket_tags` rows, deleting a ticket removes its comments, and an inserted ticket with no status arrives as `open`.
